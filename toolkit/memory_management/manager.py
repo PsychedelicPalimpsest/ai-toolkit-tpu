@@ -44,6 +44,30 @@ UNMANAGED_MODULES = [
 UNMANAGED_MODULES_INCLUDES = ["RotaryEmbedding", "Norm", "RotaryPosEmbed"]
 
 
+def _move_param_to_device(owner: torch.nn.Module, name: str, device) -> None:
+    """Move ``owner._parameters[name]`` to ``device``.
+
+    Plain ``p.data = p.data.to(device)`` raises
+    ``RuntimeError: ... incompatible tensor type`` on cross-backend moves
+    (CPU<->XLA, CPU<->meta): ``set_data`` requires identical tensor types.
+    ``nn.Module._apply`` (i.e. ``module.to()``) handles this by replacing the
+    Parameter object, so mirror that here. No-op when already on device.
+    """
+    param = owner._parameters.get(name, None)
+    if param is None:
+        return
+    try:
+        if param.device == torch.device(device):
+            return
+    except Exception:
+        pass
+    moved = param.data.to(device)
+    try:
+        param.data = moved
+    except RuntimeError:
+        owner._parameters[name] = torch.nn.Parameter(moved, requires_grad=param.requires_grad)
+
+
 class MemoryManager:
     def __init__(
         self,
@@ -105,6 +129,27 @@ class MemoryManager:
     ):
         if hasattr(module, "_memory_manager"):
             # already attached
+            return
+
+        # TPU/XLA: the bouncing offloader (pinned-CPU weights +
+        # torch.cuda.Stream/Event staging) has no XLA equivalent, and manual
+        # `p.data = p.data.to(xla)` raises "incompatible tensor type"
+        # (only nn.Module.to() handles cross-backend moves). Place the model
+        # plainly and skip all layer managers; offload fractions are ignored.
+        try:
+            _attach_device_type = torch.device(device).type
+        except Exception:
+            _attach_device_type = None
+        if _attach_device_type == "xla":
+            try:
+                from toolkit.xla_utils import warn_once
+                warn_once(
+                    "MemoryManager layer offloading is CUDA-only and disabled on "
+                    "TPU/XLA; placing model directly on the XLA device."
+                )
+            except Exception:
+                pass
+            module.to(device)
             return
 
         module._memory_manager = cls(module, device)
@@ -290,9 +335,11 @@ class MemoryManager:
         for sub in module.modules():
             if hasattr(sub, "_layer_memory_manager"):
                 continue
-            for p in sub.parameters(recurse=False):
-                if p is not None and p.device != device:
-                    p.data = p.data.to(device)
+            for pname, p in list(sub._parameters.items()):
+                if p is not None:
+                    # safe cross-backend move (plain `p.data = p.data.to()`
+                    # raises "incompatible tensor type" on CPU<->XLA/meta)
+                    _move_param_to_device(sub, pname, device)
             for name, b in sub._buffers.items():
                 if b is not None and b.device != device:
                     sub._buffers[name] = b.to(device)
@@ -388,7 +435,12 @@ class MemoryManager:
         for key in keys_to_delete:
             del _DEVICE_STATE[key]
 
-        torch.cuda.empty_cache()
+        try:
+            from toolkit.xla_utils import empty_cache
+            empty_cache()
+        except Exception:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     @classmethod
     def free(cls, module: torch.nn.Module):
@@ -439,7 +491,12 @@ class MemoryManager:
 
         # bypass any overridden/nopped-out .to() so the storages are actually freed
         torch.nn.Module.to(module, "meta")
-        torch.cuda.empty_cache()
+        try:
+            from toolkit.xla_utils import empty_cache
+            empty_cache()
+        except Exception:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     @classmethod
     def release_cached_memory(cls):
@@ -450,7 +507,12 @@ class MemoryManager:
         explicit flush. Call after free()ing a large module.
         """
         gc.collect()
-        torch.cuda.empty_cache()
+        try:
+            from toolkit.xla_utils import empty_cache
+            empty_cache()
+        except Exception:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # torch's pinned-host cache; private API, name varies by torch version
         for fn_name in ("_accelerator_emptyHostCache", "_host_emptyCache"):

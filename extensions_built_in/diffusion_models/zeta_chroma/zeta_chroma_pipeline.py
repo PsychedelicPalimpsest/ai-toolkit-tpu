@@ -44,7 +44,13 @@ class ZetaChromaPipeline(ZImagePipeline):
             return_tensors="pt",
         ).to(self.text_encoder.device)
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        # TPU-safe: use cuda autocast only when CUDA is present, else run in
+        # the text-encoder's native dtype (bf16 weights already).
+        try:
+            _amp_dev = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            _amp_dev = "cpu"
+        with torch.autocast(device_type=_amp_dev, dtype=torch.bfloat16):
             outputs = self.text_encoder(
                 input_ids=inputs.input_ids,
                 attention_mask=inputs.attention_mask,

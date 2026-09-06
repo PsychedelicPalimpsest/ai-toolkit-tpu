@@ -42,7 +42,14 @@ class ComparativeTotalVariation(torch.nn.Module):
 
 # Gradient penalty
 def get_gradient_penalty(critic, real, fake, device):
-    with torch.autocast(device_type='cuda'):
+    # TPU-safe: resolve autocast device_type from the tensor device instead of
+    # hardcoding 'cuda' (XLA has no cuda autocast kernels).
+    try:
+        from toolkit.xla_utils import autocast_device_type
+        _amp_device = autocast_device_type(device)
+    except Exception:
+        _amp_device = "cpu"
+    with torch.autocast(device_type=_amp_device):
         real = real.float()
         fake = fake.float()
         alpha = torch.rand(real.size(0), 1, 1, 1).to(device).float()

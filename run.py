@@ -40,8 +40,13 @@ if seed is not None:
     import numpy as np
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    try:
+        from toolkit.xla_utils import seed_all
+        seed_all(seed)
+    except Exception:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
 import argparse
 from toolkit.job import get_job

@@ -2610,17 +2610,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
             except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    did_oom = True
-                else:
-                    raise  # not an OOM; surface real errors
+                try:
+                    from toolkit.xla_utils import is_oom_error as _is_oom
+                    if _is_oom(e):
+                        did_oom = True
+                    else:
+                        raise  # not an OOM; surface real errors
+                except RuntimeError:
+                    raise
+                except Exception:
+                    if "CUDA out of memory" in str(e) or "out of memory" in str(e).lower():
+                        did_oom = True
+                    else:
+                        raise
             if did_oom:
                 self.num_consecutive_oom += 1
                 if self.num_consecutive_oom > 3:
                     raise RuntimeError("OOM during training step 3 times in a row, aborting training")
                 optimizer.zero_grad(set_to_none=True)
                 flush()
-                torch.cuda.ipc_collect()
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.ipc_collect()
+                except Exception:
+                    pass
                 # skip this step and keep going
                 print_acc("")
                 print_acc("################################################")
@@ -2630,7 +2643,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
             else:
                 self.num_consecutive_oom = 0
             if self.torch_profiler is not None:
-                torch.cuda.synchronize()  # Make sure all CUDA ops are done
+                try:
+                    from toolkit.xla_utils import synchronize as _sync
+                    _sync(getattr(self, "device_torch", None))
+                except Exception:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()  # Make sure all CUDA ops are done
                 self.torch_profiler.stop()
                 
                 print("\n==== Profile Results ====")

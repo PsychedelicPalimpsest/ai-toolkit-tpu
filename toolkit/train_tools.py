@@ -108,8 +108,13 @@ def get_noise_from_latents(latents):
     seed_list = get_seeds_from_latents(latents)
     noise = []
     for seed in seed_list:
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
+        try:
+            from toolkit.xla_utils import seed_all
+            seed_all(seed)
+        except Exception:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
         noise.append(torch.randn_like(latents[0]))
     return torch.stack(noise)
 

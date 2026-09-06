@@ -376,13 +376,28 @@ class OstrisModelMixin:
             # to cpu against cuda activations). quantize_device carries the
             # actual gpu in the holder flow.
             compute_device = quantize_device if quantize_device is not None else device
-            MemoryManager.attach(
-                self,
-                torch.device(compute_device),
-                offload_percent=offload,
-                ignore_modules=list(self.get_offload_ignore_modules() or []),
-            )
-        elif device is not None:
+            try:
+                _compute_type = torch.device(compute_device).type
+            except Exception:
+                _compute_type = None
+            if _compute_type == "xla":
+                # Device-driven backstop (in addition to the ModelConfig
+                # normalization): CUDA-stream offloading has no XLA
+                # equivalent and cross-backend `p.data` moves raise
+                # "incompatible tensor type", so never attach on TPU.
+                status_fn(
+                    "Layer offloading is CUDA-only and disabled on TPU/XLA; "
+                    "keeping the component on the XLA device."
+                )
+                offload = 0.0
+            else:
+                MemoryManager.attach(
+                    self,
+                    torch.device(compute_device),
+                    offload_percent=offload,
+                    ignore_modules=list(self.get_offload_ignore_modules() or []),
+                )
+        if not (offload and offload > 0) and device is not None:
             self.to(device)
         return self
 

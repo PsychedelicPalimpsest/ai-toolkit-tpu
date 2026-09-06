@@ -396,7 +396,31 @@ class TrainConfig:
         self.xformers = kwargs.get('xformers', False)
         self.sdp = kwargs.get('sdp', False)
         # see https://huggingface.co/docs/diffusers/main/optimization/attention_backends#available-backends for options
-        self.attention_backend: str = kwargs.get('attention_backend', 'native')  # native, flash, _flash_3_hub, _flash_3, 
+        self.attention_backend: str = kwargs.get('attention_backend', 'native')  # native, flash, _flash_3_hub, _flash_3,
+        # TPU/XLA: flash/xformers/sdp kernels are CUDA-only. Force math/native
+        # attention so configs copied from GPU guides don't crash on Kaggle TPUs.
+        try:
+            from toolkit.xla_utils import is_xla_available, has_tpu, warn_once
+            if is_xla_available() and has_tpu():
+                if self.xformers:
+                    warn_once("xformers=True is CUDA-only; disabling on TPU/XLA.")
+                    self.xformers = False
+                if self.sdp:
+                    warn_once("sdp=True is CUDA-only; disabling on TPU/XLA.")
+                    self.sdp = False
+                if isinstance(self.attention_backend, str) and self.attention_backend.lower() != "native":
+                    warn_once(
+                        f"attention_backend='{self.attention_backend}' is CUDA-only; "
+                        f"falling back to 'native' on TPU/XLA."
+                    )
+                    self.attention_backend = "native"
+                if isinstance(self.dtype, str) and self.dtype.lower() in ("fp16", "float16"):
+                    warn_once(
+                        "dtype fp16 trains poorly on TPU (use bf16); keeping your setting "
+                        "but consider dtype: bf16 for Kaggle TPUs."
+                    )
+        except Exception:
+            pass
         self.train_unet = kwargs.get('train_unet', True)
         self.train_text_encoder = kwargs.get('train_text_encoder', False)
         self.train_refiner = kwargs.get('train_refiner', True)
@@ -723,6 +747,45 @@ class ModelConfig:
             self.qtype = "convrot8"
         if torch.backends.mps.is_available() and self.qtype_te == "qfloat8":
             self.qtype_te = "convrot8"
+
+        # TPU/XLA: torchao fp8 + quanto qfloat8 + custom triton/convrot kernels
+        # have no XLA lowering. Quantized training on TPU silently produces
+        # wrong results or crashes in `quantize_`, so force full-precision and
+        # disable CUDA-stream layer offloading (it becomes a no-op on XLA).
+        # Users wanting max TPU memory should use gradient checkpointing +
+        # smaller batch sizes instead. See docs/TPU.md.
+        try:
+            from toolkit.xla_utils import is_xla_available, has_tpu, warn_once
+            _on_tpu_host = is_xla_available() and has_tpu()
+        except Exception:
+            _on_tpu_host = False
+        if _on_tpu_host:
+            if self.quantize:
+                warn_once(
+                    f"quantize=True (qtype={self.qtype}) is not supported on TPU/XLA "
+                    f"(torchao/quanto have no XLA kernels). Disabling quantization."
+                )
+                self.quantize = False
+            if self.quantize_te:
+                warn_once(
+                    f"quantize_te=True (qtype_te={self.qtype_te}) is not supported on TPU/XLA. "
+                    f"Disabling text-encoder quantization."
+                )
+                self.quantize_te = False
+            if self.low_vram:
+                warn_once("low_vram=True is a CUDA offload path; ignoring on TPU/XLA.")
+                self.low_vram = False
+            if self.layer_offloading:
+                warn_once(
+                    "layer_offloading=True uses torch.cuda.Stream/Event offloading with no XLA "
+                    "equivalent; disabling on TPU/XLA (model stays on xla device)."
+                )
+                self.layer_offloading = False
+                self.layer_offloading_transformer_percent = 0.0
+                self.layer_offloading_text_encoder_percent = 0.0
+            if self.compile:
+                warn_once("torch.compile is not supported on TPU/XLA via inductor; disabling compile.")
+                self.compile = False
         
         # 0 is off and 1.0 is 100% of the layers
         self.layer_offloading_transformer_percent = kwargs.get("layer_offloading_transformer_percent", 1.0)

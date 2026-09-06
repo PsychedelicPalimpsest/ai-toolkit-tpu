@@ -76,9 +76,22 @@ def _get_device_state(device: torch.device):
 # compute. This is the deeper-pipeline + relaxed-dependency change in one.
 
 
+def _is_cuda_device(device) -> bool:
+    try:
+        return torch.device(device).type == "cuda"
+    except Exception:
+        return False
+
+
 def _stage_forward_weight(state, device, materialize, weight_cpu, bias_cpu):
     """H2D the next forward weight (+bias) into its ring slot; return (idx, w, b).
     Caller runs compute, then calls _release_forward_slot(state, idx)."""
+    if not _is_cuda_device(device):
+        # No CUDA streams on CPU/MPS/XLA: materialize synchronously. Returned
+        # idx is a dummy; _release_forward_slot is a no-op for it.
+        w = materialize(weight_cpu, device)
+        b = bias_cpu.to(device) if bias_cpu is not None else None
+        return -1, w, b
     d = state["depth"]
     idx = state["forward_clk"]
     state["forward_clk"] = (idx + 1) % d
@@ -96,12 +109,16 @@ def _stage_forward_weight(state, device, materialize, weight_cpu, bias_cpu):
 
 def _release_forward_slot(state, idx):
     # Slot is reusable once the compute stream finishes the op that read it.
+    if idx == -1:
+        return
     state["fwd_slot_free"][idx].record()
 
 
 def _stage_backward_weight(state, device, materialize, weight_cpu):
     """H2D the next backward weight into its ring slot; return (idx, w).
     Caller runs grad-input compute, then _release_backward_weight_slot."""
+    if not _is_cuda_device(device):
+        return -1, materialize(weight_cpu)
     d = state["depth"]
     idx = state["backward_clk"]
     state["backward_clk"] = (idx + 1) % d
@@ -115,6 +132,8 @@ def _stage_backward_weight(state, device, materialize, weight_cpu):
 
 
 def _release_backward_weight_slot(state, idx):
+    if idx == -1:
+        return
     state["bwd_slot_free"][idx].record()
 
 
@@ -129,6 +148,11 @@ def _stage_grads_to_cpu(state, idx, grad_w_gpu, grad_b_gpu, weight_cpu, bias_cpu
     read we can't defer is grad accumulation: when the param already holds a
     .grad, AccumulateGrad does `grad += returned` on the engine thread the
     moment backward returns, so block here until the copy has landed."""
+    if "transfer_grad_stream" not in state:
+        # Synchronous fallback for CPU/MPS/XLA (no grad stream).
+        grad_w_cpu = grad_w_gpu.to("cpu") if grad_w_gpu is not None else None
+        grad_b_cpu = grad_b_gpu.to("cpu") if grad_b_gpu is not None else None
+        return grad_w_cpu, grad_b_cpu
     gs = state["transfer_grad_stream"]
     state["grad_compute_done"][idx].record()  # on the compute stream
     grad_w_cpu = grad_b_cpu = None
@@ -268,7 +292,15 @@ def _move_params_to_cpu_and_pin(module: nn.Module):
                     nn.Parameter(cpu_data, requires_grad=param.requires_grad),
                 )
             else:
-                param.data = cpu_data
+                try:
+                    param.data = cpu_data
+                except RuntimeError:
+                    # cross-backend move (e.g. XLA->CPU): set_data requires
+                    # identical tensor types, so replace the Parameter object
+                    # instead (mirrors nn.Module._apply).
+                    module._parameters[name] = torch.nn.Parameter(
+                        cpu_data, requires_grad=param.requires_grad
+                    )
 
 
 # ==========================
@@ -303,13 +335,16 @@ class _BouncingLinearFn(torch.autograd.Function):
             return w_gpu
 
         if device.type != "cuda":
+            # XLA/TPU has no CUDA streams: compute on-device instead of the
+            # CPU bounce used for CUDA offloading. CPU/MPS keep legacy path.
+            _compute_dev = device if device.type == "xla" else torch.device("cpu")
             out = F.linear(
-                x.to("cpu"),
-                _materialize_linear_weight(weight_cpu, torch.device("cpu")),
-                bias_cpu,
+                x.to(_compute_dev),
+                _materialize_linear_weight(weight_cpu, _compute_dev),
+                bias_cpu.to(_compute_dev) if bias_cpu is not None else None,
             )
             ctx.save_for_backward(x.to("cpu"), weight_cpu, bias_cpu)
-            ctx.device = torch.device("cpu")
+            ctx.device = torch.device("cpu") if _compute_dev.type == "cpu" else device
             return out.to(x.device)
 
         if x.device != device:
@@ -652,7 +687,15 @@ class EmbeddingLayerMemoryManager(BaseLayerMemoryManager):
         super().__init__(module, manager)
 
         # cpu-resident weight; no pinning — the weight never crosses the bus
-        module.weight.data = module.weight.data.to("cpu")
+        try:
+            module.weight.data = module.weight.data.to("cpu")
+        except RuntimeError:
+            # cross-backend move (e.g. XLA->CPU): replace the Parameter
+            # instead of set_data (mirrors nn.Module._apply).
+            w = module.weight
+            module._parameters["weight"] = torch.nn.Parameter(
+                w.data.to("cpu"), requires_grad=w.requires_grad
+            )
         # subclass buffers (gemma's embed_scale) must join the cpu-side math
         for buf_name, buf in module._buffers.items():
             if buf is not None:

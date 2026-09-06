@@ -121,7 +121,18 @@ class DTO(torch.Tensor):
         return self.to("cpu")
 
     def cuda(self, device=None):
-        return self.to(device if device is not None else "cuda")
+        # TPU-safe: fall back to a device-agnostic move when CUDA is absent
+        # (e.g. Kaggle TPU VMs where torch.cuda.is_available() is False).
+        if device is None:
+            try:
+                import torch as _torch
+                if not _torch.cuda.is_available():
+                    # keep extras attached, move main tensor to its current device (no-op)
+                    return self.to(self.device)
+            except Exception:
+                pass
+            device = "cuda"
+        return self.to(device)
 
     def clone(self):
         return self.map(lambda t: t.clone())

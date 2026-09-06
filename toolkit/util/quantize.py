@@ -364,6 +364,25 @@ def quantize_module(
     rather than burning every cpu core."""
     from toolkit.dequantize import patch_dequantization_on_save
 
+    # TPU/XLA has no torchao/quanto/triton kernels: skip quantization and keep
+    # full-precision weights on the XLA device instead of crashing mid-load.
+    try:
+        _dev_type = torch.device(device).type if device is not None else None
+        if _dev_type == "xla":
+            from toolkit.xla_utils import warn_once
+            warn_once(
+                f"Skipping {qtype} quantization on TPU/XLA (no XLA kernels); "
+                f"continuing in full precision."
+            )
+            if device is not None:
+                try:
+                    module.to(device)
+                except Exception:
+                    pass
+            return module
+    except Exception:
+        pass
+
     patch_dequantization_on_save(module)
     quantization_type = get_qtype(qtype)
     exclude = list(exclude or [])

@@ -17,9 +17,14 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 def flush(garbage_collect=True):
-    torch.cuda.empty_cache()
-    if garbage_collect:
-        gc.collect()
+    try:
+        from toolkit.xla_utils import empty_cache
+        empty_cache() if garbage_collect else None
+    except Exception:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if garbage_collect:
+            gc.collect()
 
 
 ControlTypes = Literal['depth', 'pose', 'line', 'inpaint', 'mask']
@@ -311,7 +316,15 @@ if __name__ == "__main__":
     for img_path in tqdm(img_list):
         for control in controls:
             start = time.time()
-            control_gen = ControlGenerator(torch.device('cuda'))
+            _cg_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            try:
+                from toolkit.xla_utils import is_xla_available, has_tpu
+                if is_xla_available() and has_tpu():
+                    import torch_xla.core.xla_model as xm
+                    _cg_device = xm.xla_device()
+            except Exception:
+                pass
+            control_gen = ControlGenerator(_cg_device)
             control_gen.debug = args.debug
             control_gen.regen = args.regen
             control_path = control_gen.get_control_path(img_path, control)

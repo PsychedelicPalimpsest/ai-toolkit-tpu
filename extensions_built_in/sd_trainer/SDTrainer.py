@@ -2322,7 +2322,12 @@ class SDTrainer(BaseSDTrainProcess):
             else:
                 total_loss += loss
             if len(batch_list) > 1 and self.model_config.low_vram:
-                torch.cuda.empty_cache()
+                try:
+                    from toolkit.xla_utils import empty_cache as _empty_cache
+                    _empty_cache()
+                except Exception:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
 
         if not self.is_grad_accumulation_step:
@@ -2338,7 +2343,14 @@ class SDTrainer(BaseSDTrainProcess):
                     self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
-                self.optimizer.step()
+                # XLA-aware step (xm.optimizer_step on TPU, plain step elsewhere)
+                # + explicit mark_step so lazy XLA graphs actually execute.
+                try:
+                    from toolkit.xla_utils import optimizer_step as _xla_optimizer_step, mark_step as _mark_step
+                    _xla_optimizer_step(self.optimizer)
+                    _mark_step()
+                except Exception:
+                    self.optimizer.step()
 
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.adapter and isinstance(self.adapter, CustomAdapter):

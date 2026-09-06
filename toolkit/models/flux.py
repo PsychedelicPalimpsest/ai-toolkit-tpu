@@ -126,6 +126,11 @@ def add_model_gpu_splitter_to_flux(
     other_module_param_count_scale: Optional[float] = 0.3
 ):
     gpu_id_list = [i for i in range(torch.cuda.device_count())]
+    if len(gpu_id_list) == 0:
+        # No CUDA GPUs (CPU, MPS, or TPU/XLA host): model splitting is a
+        # multi-GPU CUDA optimisation with no meaning here. Leave the model
+        # un-split instead of ZeroDivisionError on `total / 0`.
+        return
     
     # if len(gpu_id_list) > 2:
     #     raise ValueError("Cannot split to more than 2 GPUs currently.")

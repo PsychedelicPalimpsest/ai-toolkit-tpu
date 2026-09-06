@@ -1,0 +1,93 @@
+---
+job: extension
+config:
+  name: "flux2_klein_4b_tpu"
+  process:
+    - type: 'diffusion_trainer'
+      training_folder: "/kaggle/working/ai-toolkit/output"
+      sqlite_db_path: "./aitk_db.db"
+      # informational only: BaseSDTrainProcess trains on accelerator.device
+      # (xla:0 on Kaggle TPUs when torch_xla is installed). See docs/TPU.md.
+      device: "xla"
+      trigger_word: null
+      performance_log_every: 10
+      # NOTE: no `network` block here = full finetune. On TPU this is
+      # experimental (single-core HBM). Prefer adding a LoRA `network` block
+      # if you OOM. See docs/TPU.md.
+      save:
+        dtype: "bf16"
+        save_every: 100
+        max_step_saves_to_keep: 1
+        save_format: "diffusers"
+        push_to_hub: false
+      datasets:
+        - folder_path: "/kaggle/working/bigdataset"
+          mask_path: null
+          mask_min_value: 0.1
+          default_caption: ""
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          is_reg: false
+          # keep static resolution on TPU: XLA recompiles per shape
+          resolution: [512, 768]
+          controls: []
+          shrink_video_to_frames: true
+          num_frames: 1
+          flip_x: false
+          flip_y: false
+          num_repeats: 1
+          control_path_1: null
+          control_path_2: null
+          control_path_3: null
+      train:
+        batch_size: 1
+        bypass_guidance_embedding: false
+        steps: 8000
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        # TPU-safe: adamw (adamw8bit auto-falls-back to adamw with a warning)
+        optimizer: "adamw"
+        timestep_type: "weighted"
+        content_or_style: "balanced"
+        optimizer_params:
+          weight_decay: 0.0001
+        unload_text_encoder: true
+        cache_text_embeddings: true
+        lr: 1.0e-05
+        ema_config:
+          use_ema: false
+          ema_decay: 0.99
+        skip_first_sample: true
+        force_first_sample: false
+        disable_sampling: true
+        dtype: "bf16"
+        diff_output_preservation: false
+        diff_output_preservation_multiplier: 1
+        diff_output_preservation_class: "person"
+        switch_boundary_every: 1
+        loss_type: "mse"
+        # TPU-safe attention (flash/xformers are CUDA-only)
+        attention_backend: "native"
+      logging:
+        log_every: 1
+        use_ui_logger: true
+      model:
+        name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"
+        # TPU-safe: no quantized training on XLA (torchao/quanto lack kernels)
+        quantize: false
+        qtype: "qfloat8"
+        quantize_te: false
+        qtype_te: "qfloat8"
+        arch: "flux2_klein_4b"
+        # TPU-safe: CUDA-stream offloading has no XLA equivalent (auto-disabled
+        # with a warning if left true; set false explicitly to silence it)
+        low_vram: false
+        model_kwargs:
+          match_target_res: false
+        layer_offloading: false
+        layer_offloading_text_encoder_percent: 0.0
+        layer_offloading_transformer_percent: 0.0
