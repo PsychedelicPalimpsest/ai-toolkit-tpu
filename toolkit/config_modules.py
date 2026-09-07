@@ -748,6 +748,13 @@ class ModelConfig:
         if torch.backends.mps.is_available() and self.qtype_te == "qfloat8":
             self.qtype_te = "convrot8"
 
+        # 0 is off and 1.0 is 100% of the layers
+        self.layer_offloading_transformer_percent = kwargs.get("layer_offloading_transformer_percent", 1.0)
+        self.layer_offloading_text_encoder_percent = kwargs.get("layer_offloading_text_encoder_percent", 1.0)
+
+        # compile the model with torch compile
+        self.compile = kwargs.get("compile", False)
+
         # TPU/XLA: torchao fp8 + quanto qfloat8 + custom triton/convrot kernels
         # have no XLA lowering. Quantized training on TPU silently produces
         # wrong results or crashes in `quantize_`, so force full-precision and
@@ -786,10 +793,6 @@ class ModelConfig:
             if self.compile:
                 warn_once("torch.compile is not supported on TPU/XLA via inductor; disabling compile.")
                 self.compile = False
-        
-        # 0 is off and 1.0 is 100% of the layers
-        self.layer_offloading_transformer_percent = kwargs.get("layer_offloading_transformer_percent", 1.0)
-        self.layer_offloading_text_encoder_percent = kwargs.get("layer_offloading_text_encoder_percent", 1.0)
 
         # can be used to load the extras like text encoder or vae from here
         # only setup for some models but will prevent having to download the te for
@@ -802,9 +805,6 @@ class ModelConfig:
         # parse ARA from qtype
         if self.qtype is not None and "|" in self.qtype:
             self.qtype, self.accuracy_recovery_adapter = self.qtype.split('|')
-
-        # compile the model with torch compile
-        self.compile = kwargs.get("compile", False)
 
         if self.compile and self.quantize:
             print("Quantized model detected - allowing torch.compile (experimental)")
