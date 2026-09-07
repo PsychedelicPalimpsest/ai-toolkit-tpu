@@ -485,6 +485,27 @@ class TrainConfig:
             if self.gradient_accumulation_steps != 1:
                 raise ValueError("gradient_accumulation and gradient_accumulation_steps are mutually exclusive")
 
+        # TPU multi-core data-parallel: number of TPU cores to train on
+        # (xmp.spawn, one process per core, gradients averaged with
+        # xm.optimizer_step). 1 = current single-core behaviour on every
+        # backend. Effective batch size scales with this value. See docs/TPU.md.
+        self.tpu_num_cores: int = kwargs.get('tpu_num_cores', 1) or 1
+        try:
+            self.tpu_num_cores = max(1, int(self.tpu_num_cores))
+        except Exception:
+            self.tpu_num_cores = 1
+        if self.tpu_num_cores > 1:
+            try:
+                from toolkit.xla_utils import is_xla_available, has_tpu, warn_once
+                if not (is_xla_available() and has_tpu()):
+                    warn_once(
+                        f"tpu_num_cores={self.tpu_num_cores} requested but no TPU "
+                        f"is visible; falling back to single-process."
+                    )
+                    self.tpu_num_cores = 1
+            except Exception:
+                pass
+
         # short long captions will double your batch size. This only works when a dataset is
         # prepared with a json caption file that has both short and long captions in it. It will
         # Double up every image and run it through with both short and long captions. The idea

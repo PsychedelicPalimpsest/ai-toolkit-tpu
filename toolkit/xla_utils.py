@@ -207,3 +207,139 @@ def is_oom_error(exc: BaseException) -> bool:
 
 def warn_once(message: str):
     warnings.warn(f"[ai-toolkit][TPU-compat] {message}", stacklevel=3)
+
+
+# ---------------------------------------------------------------------------
+# Multi-core TPU (data-parallel across TPU cores via xmp.spawn).
+#
+# Single-process / CUDA / CPU behaviour is unchanged: every helper below
+# degrades to ordinal 0 / world size 1 / no-op barrier when torch_xla is
+# missing or only one replica is running.
+# ---------------------------------------------------------------------------
+
+def get_ordinal() -> int:
+    """XLA replica ordinal (0 .. world_size-1). 0 when XLA is unavailable."""
+    if not is_xla_available():
+        return 0
+    try:
+        import torch_xla.core.xla_model as xm
+        return int(xm.get_ordinal())
+    except Exception:
+        return 0
+
+
+def get_world_size() -> int:
+    """Number of XLA replicas. 1 when XLA is unavailable or single-core."""
+    if not is_xla_available():
+        return 1
+    try:
+        import torch_xla.runtime as xr
+        return max(1, int(xr.world_size()))
+    except Exception:
+        pass
+    try:
+        import torch_xla.core.xla_model as xm
+        return max(1, int(xm.xrt_world_size()))
+    except Exception:
+        return 1
+
+
+def is_master_ordinal() -> bool:
+    """True on replica 0 (or anywhere when not running multi-core XLA)."""
+    return get_ordinal() == 0
+
+
+def is_xla_multiprocess() -> bool:
+    """True when several XLA replicas train together (xmp.spawn, N>1)."""
+    return is_xla_available() and get_world_size() > 1
+
+
+def is_global_main_process(accelerator=None) -> bool:
+    """Rank-0 check that stays correct under TPU multi-core spawn.
+
+    Plain ``accelerator.is_main_process`` is True in *every* spawned XLA
+    worker (each builds its own ``Accelerator`` with world_size 1), so disk
+    IO guarded only by it would run N times. This additionally requires XLA
+    ordinal 0. Outside multi-core XLA it is exactly ``is_main_process``.
+    """
+    if accelerator is not None:
+        try:
+            if not accelerator.is_main_process:
+                return False
+        except Exception:
+            pass
+    return is_master_ordinal()
+
+
+def rendezvous(tag: str):
+    """Cross-replica barrier under xmp.spawn; no-op otherwise.
+
+    Use next to ``accelerator.wait_for_everyone()`` at save/sample/cache
+    points so workers do not race ahead while rank 0 writes checkpoints.
+    """
+    if not is_xla_multiprocess():
+        return
+    try:
+        import torch_xla.core.xla_model as xm
+        xm.rendezvous(tag)
+    except Exception:
+        pass
+
+
+def reduce_mean_scalar(value: float) -> float:
+    """Mean of a python scalar across XLA replicas (logging only).
+
+    The training loss is already backpropagated locally; this just keeps
+    logged/saved loss values representative of the global batch.
+    """
+    if not is_xla_multiprocess():
+        return float(value)
+    try:
+        import torch_xla.core.xla_model as xm
+        t = torch.tensor(float(value), device=xm.xla_device())
+        mean = xm.all_reduce(xm.REDUCE_SUM, t) / get_world_size()
+        mark_step()
+        return float(mean.detach().to("cpu"))
+    except Exception:
+        return float(value)
+
+
+def shard_for_tpu_rank(items, sort: bool = True):
+    """Shard a file/item list across XLA replicas (DistributedSampler-style).
+
+    Each rank keeps ``items[ordinal::world_size]`` so every epoch the union
+    of ranks covers the dataset once. Single-process: returns ``items``
+    untouched (no sorting either) so CUDA/CPU behaviour is bit-identical.
+    """
+    if not is_xla_multiprocess():
+        return items
+    items = list(items)
+    if sort:
+        try:
+            items = sorted(items)
+        except Exception:
+            pass
+    return items[get_ordinal()::get_world_size()]
+
+
+def reseed_for_tpu_rank(base_seed=None):
+    """Give each TPU replica a different shuffle/noise RNG stream.
+
+    Call AFTER model/weight init (which must stay identical on all ranks)
+    but BEFORE dataloader iteration. No-op unless multi-core XLA.
+    Returns the agreed base seed (or None when single-process).
+    """
+    if not is_xla_multiprocess():
+        return base_seed
+    import random
+    if base_seed is None:
+        draw = str(random.SystemRandom().randint(0, 2 ** 31 - 1))
+        try:
+            import torch_xla.core.xla_model as xm
+            # rendezvous returns every replica's payload; [0] is rank 0's,
+            # so all ranks agree on one base seed.
+            base_seed = int(xm.rendezvous("aitk_base_seed", draw)[0])
+        except Exception:
+            base_seed = int(draw)
+    seed_all(int(base_seed) + get_ordinal())
+    return int(base_seed)

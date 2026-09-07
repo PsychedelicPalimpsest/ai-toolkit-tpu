@@ -453,6 +453,15 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             # repeat the list
             file_list = file_list * self.dataset_config.num_repeats
 
+        # TPU multi-core data-parallel: each core trains on a disjoint
+        # file_list[ordinal::world_size] shard (DistributedSampler-style).
+        # Single-process returns the list untouched.
+        try:
+            from toolkit.xla_utils import shard_for_tpu_rank
+            file_list = shard_for_tpu_rank(file_list, sort=True)
+        except Exception:
+            pass
+
         if self.dataset_config.standardize_images:
             if self.sd.is_xl or self.sd.is_vega or self.sd.is_ssd:
                 NormalizeMethod = NormalizeSDXLTransform
@@ -556,9 +565,16 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 print_acc(e)
                 bad_count += 1
 
-        # save the size database
-        with open(dataset_size_file, 'w') as f:
-            json.dump(self.size_database, f)
+        # save the size database (master only under TPU multi-core spawn;
+        # every rank already holds the identical dict in memory)
+        try:
+            from toolkit.xla_utils import is_master_ordinal
+            _can_write_size_db = is_master_ordinal()
+        except Exception:
+            _can_write_size_db = True
+        if _can_write_size_db:
+            with open(dataset_size_file, 'w') as f:
+                json.dump(self.size_database, f)
         
         if self.is_video:
             num_videos = len([x for x in self.file_list if x.is_video])

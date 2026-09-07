@@ -238,7 +238,7 @@ class DiffusionTrainer(SDTrainer):
                 self.progress_bar.unpause()
 
     async def _update_key(self, key, value):
-        if not self.accelerator.is_main_process:
+        if not self._is_leader():
             return
 
         def _do_update():
@@ -263,16 +263,16 @@ class DiffusionTrainer(SDTrainer):
 
     def update_step(self):
         """Non-blocking update of the step count."""
-        if self.accelerator.is_main_process and self.is_ui_trainer:
+        if self._is_leader() and self.is_ui_trainer:
             self._run_async_operation(self._update_key("step", self.step_num))
 
     def update_db_key(self, key, value):
         """Non-blocking update a key in the database."""
-        if self.accelerator.is_main_process and self.is_ui_trainer:
+        if self._is_leader() and self.is_ui_trainer:
             self._run_async_operation(self._update_key(key, value))
 
     async def _update_status(self, status: AITK_Status, info: Optional[str] = None):
-        if not self.accelerator.is_main_process or not self.is_ui_trainer:
+        if not self._is_leader() or not self.is_ui_trainer:
             return
 
         def _do_update():
@@ -297,7 +297,7 @@ class DiffusionTrainer(SDTrainer):
 
     def update_status(self, status: AITK_Status, info: Optional[str] = None):
         """Non-blocking update of status."""
-        if self.accelerator.is_main_process and self.is_ui_trainer:
+        if self._is_leader() and self.is_ui_trainer:
             self._run_async_operation(self._update_status(status, info))
 
     async def wait_for_all_async(self):
@@ -325,9 +325,9 @@ class DiffusionTrainer(SDTrainer):
                         # silence the bar so tqdm doesn't repaint it at interpreter exit
                         progress_bar.disable = True
                         progress_bar.close()
-                    if self.accelerator.is_main_process:
+                    if self._is_leader():
                         self.update_status("stopped", "Job stopped")
-                elif self.accelerator.is_main_process and not self.is_stopping:
+                elif self._is_leader() and not self.is_stopping:
                     self.update_status("error", str(e))
                 self.update_db_key("step", self.last_save_step)
                 asyncio.run(self.wait_for_all_async())

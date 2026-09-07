@@ -2378,6 +2378,14 @@ class SDTrainer(BaseSDTrainProcess):
         loss_dict = OrderedDict(
             {'loss': (total_loss / len(batch_list)).item()}
         )
+        # TPU multi-core: report the cross-replica mean so logs reflect the
+        # global batch. The backward pass above already used the local loss;
+        # gradient averaging happens in xm.optimizer_step. No-op otherwise.
+        try:
+            from toolkit.xla_utils import reduce_mean_scalar
+            loss_dict = OrderedDict({'loss': reduce_mean_scalar(loss_dict['loss'])})
+        except Exception:
+            pass
 
         self.end_of_training_loop()
 

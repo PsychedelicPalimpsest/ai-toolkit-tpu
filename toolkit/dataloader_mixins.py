@@ -2012,6 +2012,15 @@ class LatentCachingMixin:
             if did_move:
                 self.sd.restore_device_state()
 
+            # TPU multi-core: each rank cached its own file shard above; wait
+            # until every rank's caches are on disk before training starts.
+            # No-op unless several XLA replicas are running.
+            try:
+                from toolkit.xla_utils import rendezvous
+                rendezvous("aitk_cache_latents")
+            except Exception:
+                pass
+
     def _remove_file_items(self: 'AiToolkitDataset', items_to_remove: List['FileItemDTO']):
         # buckets hold raw indices into file_list, so removal requires remapping them
         remove_ids = {id(item) for item in items_to_remove}
@@ -2562,6 +2571,14 @@ class TextEmbeddingCachingMixin:
             # if did_move:
             #     self.sd.restore_device_state()
 
+            # TPU multi-core: each rank cached its own file shard above; wait
+            # until every rank's caches are on disk before training starts.
+            try:
+                from toolkit.xla_utils import rendezvous
+                rendezvous("aitk_cache_text_embeds")
+            except Exception:
+                pass
+
 
 class CLIPCachingMixin:
     def __init__(self: 'AiToolkitDataset', **kwargs):
@@ -2625,6 +2642,14 @@ class CLIPCachingMixin:
 
             is_noise_zero = hasattr(self.sd.adapter, 'clip_noise_zero') and self.sd.adapter.clip_noise_zero
 
+            # TPU multi-core: the unconditional cache below lives at one shared
+            # path on all ranks. Rank 0 generates it, other ranks wait for it,
+            # then everyone reuses the same files. No-op on a single process.
+            try:
+                from toolkit.xla_utils import is_master_ordinal, rendezvous
+                _clip_cache_master = is_master_ordinal()
+            except Exception:
+                _clip_cache_master = True
             for i in range(self.clip_vision_num_unconditional_cache):
                 hash_dict = OrderedDict([
                     ("image_encoder_path", image_encoder_path),
@@ -2639,6 +2664,10 @@ class CLIPCachingMixin:
                 uncond_path = os.path.join(clip_vision_cache_path, f'uncond_{hash_str}_{i}.safetensors')
                 if os.path.exists(uncond_path):
                     # skip it
+                    unconditional_paths.append(uncond_path)
+                    continue
+                if not _clip_cache_master:
+                    # rank 0 generates it below the barrier; reuse its file
                     unconditional_paths.append(uncond_path)
                     continue
 
@@ -2676,6 +2705,11 @@ class CLIPCachingMixin:
                 os.makedirs(os.path.dirname(uncond_path), exist_ok=True)
                 save_file(state_dict, uncond_path)
                 unconditional_paths.append(uncond_path)
+
+            try:
+                rendezvous("aitk_clip_uncond")
+            except Exception:
+                pass
 
             self.clip_vision_unconditional_cache = unconditional_paths
 
@@ -2731,6 +2765,13 @@ class CLIPCachingMixin:
             # flush every 100
             # if i % 100 == 0:
             #     flush()
+
+            # TPU multi-core: each rank cached its own file shard above.
+            try:
+                from toolkit.xla_utils import rendezvous as _rv
+                _rv("aitk_cache_clip")
+            except Exception:
+                pass
 
         # restore device state
         self.sd.restore_device_state()

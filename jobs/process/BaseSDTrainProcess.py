@@ -280,7 +280,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return generate_image_config_list
 
     def sample(self, step=None, is_first=False):
-        if not self.accelerator.is_main_process:
+        if not self._is_leader():
             return
         flush()
         sample_folder = os.path.join(self.save_root, 'samples')
@@ -416,7 +416,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return info
 
     def clean_up_saves(self):
-        if not self.accelerator.is_main_process:
+        if not self._is_leader():
             return
         # remove old saves
         # get latest saved step
@@ -503,7 +503,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         pass
 
     def save(self, step=None):
-        if not self.accelerator.is_main_process:
+        if not self._is_leader():
             return
         flush()
         if self.ema is not None:
@@ -733,8 +733,28 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # override in subclass
         return params
 
+    def _is_leader(self) -> bool:
+        """Rank-0 check that stays correct under TPU multi-core spawn.
+
+        Plain ``accelerator.is_main_process`` is True in *every* spawned XLA
+        worker (each builds its own ``Accelerator`` with world_size 1), so
+        disk IO guarded only by it would run once per core. This additionally
+        requires XLA ordinal 0. Single-process / CUDA / CPU behaviour is
+        exactly ``is_main_process``.
+        """
+        try:
+            if not self.accelerator.is_main_process:
+                return False
+        except Exception:
+            pass
+        try:
+            from toolkit.xla_utils import is_master_ordinal
+            return is_master_ordinal()
+        except Exception:
+            return True
+
     def hook_before_train_loop(self):
-        if self.accelerator.is_main_process:
+        if self._is_leader():
             self.logger.start()
         self.prepare_accelerator()
         
@@ -865,8 +885,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return latest_path
 
     def load_training_state_from_metadata(self, path):
-        if not self.accelerator.is_main_process:
-            return
+        # NB: intentionally NOT leader-guarded. Every TPU worker must resume
+        # from the same step; concurrent reads of the same file are safe.
         if path is not None and self.network_config is not None and path == self.network_config.pretrained_lora_path:
             # dont load metadata from pretrained lora
             return
@@ -1562,7 +1582,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         val_config = self.train_config.validation_config
         if val_config is None:
             return
-        if not self.accelerator.is_main_process:
+        if not self._is_leader():
             return
         validation_items = []
         for item in val_config.validation_items:
@@ -1650,7 +1670,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         val_config = self.train_config.validation_config
         if val_config is None or self._validation_cache is None:
             return
-        if not self.accelerator.is_main_process:
+        if not self._is_leader():
             return
         device = self.device_torch
         dtype = get_torch_dtype(self.train_config.dtype)
@@ -2464,7 +2484,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             print_acc("Generating baseline samples before training")
             self.sample(self.step_num)
         
-        if self.accelerator.is_local_main_process:
+        if self.accelerator.is_local_main_process and self._is_leader():
             self.progress_bar = ToolkitProgressBar(
                 total=self.train_config.steps,
                 desc=self.job.name,
@@ -2475,6 +2495,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.progress_bar.pause()
         else:
             self.progress_bar = None
+
+        # TPU multi-core: same seed built identical models on every rank;
+        # now diverge the shuffle/noise streams so cores train on different
+        # batches. No-op unless several XLA replicas are running.
+        try:
+            from toolkit.xla_utils import reseed_for_tpu_rank
+            reseed_for_tpu_rank(self.training_seed)
+        except Exception:
+            pass
 
         if self.data_loader is not None:
             dataloader = self.data_loader
@@ -2708,6 +2737,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.step_num != self.start_step:
                     if is_sample_step or is_save_step:
                         self.accelerator.wait_for_everyone()
+                        try:
+                            # Real cross-replica barrier under xmp.spawn
+                            # (accelerator sees world_size 1 per worker).
+                            from toolkit.xla_utils import rendezvous
+                            rendezvous(f"aitk_pre_io_{self.step_num}")
+                        except Exception:
+                            pass
                         
                     if is_save_step:
                         self.accelerator
@@ -2744,14 +2780,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if self.logging_config.log_every and self.step_num % self.logging_config.log_every == 0:
                         with self.timer('log_to_tensorboard'):
                             # log to tensorboard
-                            if self.accelerator.is_main_process:
+                            if self._is_leader():
                                 if self.writer is not None:
                                     if loss_dict is not None:
                                         for key, value in loss_dict.items():
                                             self.writer.add_scalar(f"{key}", value, self.step_num)
                                         self.writer.add_scalar(f"lr", learning_rate, self.step_num)
 
-                        if self.accelerator.is_main_process:
+                        if self._is_leader():
                             # log to logger
                             self.logger.log({
                                 'learning_rate': learning_rate,
@@ -2768,7 +2804,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     })
                                 self.additional_logs = {}
                     elif self.logging_config.log_every is None:
-                        if self.accelerator.is_main_process:
+                        if self._is_leader():
                             # log every step
                             self.logger.log({
                                 'learning_rate': learning_rate,
@@ -2791,7 +2827,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.timer.reset()
                 
                 # commit log
-                if self.accelerator.is_main_process:
+                if self._is_leader():
                     with self.timer('commit_logger'):
                         self.logger.commit(step=self.step_num)
 
@@ -2813,21 +2849,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
         ##  END TRAIN LOOP
         ###################################################################
         self.accelerator.wait_for_everyone()
+        try:
+            from toolkit.xla_utils import rendezvous
+            rendezvous("aitk_end_train")
+        except Exception:
+            pass
         if self.progress_bar is not None:
             self.progress_bar.close()
         if self.train_config.free_u:
             self.sd.pipeline.disable_freeu()
-        if self.accelerator.is_main_process:
+        if self._is_leader():
             self.save()
         if not self.train_config.disable_sampling:
             self.sample(self.step_num)
             self.logger.commit(step=self.step_num)
         print_acc("")
-        if self.accelerator.is_main_process:
+        if self._is_leader():
             self.logger.finish()
         self.accelerator.end_training()
 
-        if self.accelerator.is_main_process:
+        if self._is_leader():
             # push to hub
             if self.save_config.push_to_hub:
                 if("HF_TOKEN" not in os.environ):
@@ -2854,7 +2895,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
     repo_id: str,
     private: bool = False,
     ):  
-        if not self.accelerator.is_main_process:
+        if not self._is_leader():
             return
         readme_content = self._generate_readme(repo_id)
         readme_path = os.path.join(self.save_root, "README.md")

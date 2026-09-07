@@ -69,6 +69,15 @@ class BaseTrainProcess(BaseProcess):
 
     def setup_tensorboard(self):
         if self.log_dir:
+            try:
+                # Under TPU multi-core spawn only ordinal 0 owns the writer;
+                # every worker building a timestamped SummaryWriter would
+                # scatter 8 log dirs per run.
+                from toolkit.xla_utils import is_master_ordinal
+                if not is_master_ordinal():
+                    return
+            except Exception:
+                pass
             from torch.utils.tensorboard import SummaryWriter
             now = datetime.now()
             time_str = now.strftime('%Y%m%d-%H%M%S')
@@ -77,6 +86,12 @@ class BaseTrainProcess(BaseProcess):
             self.writer = SummaryWriter(summary_dir)
 
     def save_training_config(self):
+        try:
+            from toolkit.xla_utils import is_master_ordinal
+            if not is_master_ordinal():
+                return
+        except Exception:
+            pass
         os.makedirs(self.save_root, exist_ok=True)
         save_dif = os.path.join(self.save_root, f'config.yaml')
         with open(save_dif, 'w') as f:

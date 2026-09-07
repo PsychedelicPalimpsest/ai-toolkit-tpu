@@ -119,8 +119,15 @@ FLUX.2-klein full-finetune request):
   recommended on TPU; full finetune is experimental.
 * `cache_latents_to_disk: true` + `cache_text_embeddings: true` + 
   `unload_text_encoder: true` all work on TPU and save HBM.
-* Single-core only for now: this port runs on `xla:0`. Multi-core
-  (`xmp.spawn` / FSDP / SPMD) is not wired up — the other 7 TPU cores idle.
+* Multi-core data-parallel is supported: set `train.tpu_num_cores: 8`
+  (or pass `--tpu_cores 8` / `AITK_TPU_CORES=8`). `run.py` spawns one process
+  per core via `torch_xla.distributed.xla_multiprocessing.spawn`; each core
+  trains on a disjoint `file_list[ordinal::world_size]` dataset shard and
+  gradients are averaged with `xm.optimizer_step`. Effective batch size is
+  `batch_size × gradient_accumulation × tpu_num_cores`, so scale LR/steps
+  accordingly. Latent / text-embedding / clip caches are sharded too (each
+  rank caches its own files, then a rendezvous), while checkpoints, samples,
+  logs and the sqlite DB stay rank-0-only.
 
 ## Limitations (honest)
 
@@ -130,5 +137,6 @@ FLUX.2-klein full-finetune request):
   resolution, enable checkpointing, or switch to LoRA.
 * Sampling (`sample_every`) runs on XLA and is slow; set
   `disable_sampling: true` for smoke tests.
-* Multi-core TPU training not implemented; contributions welcome
-  (`torch_xla.distributed.xla_multiprocessing` + `MpDeviceLoader`).
+* Model sharding (FSDP / SPMD) is not implemented — multi-core is
+  data-parallel (replicated model, sharded batches). A single core's HBM
+  still bounds model size; contributions welcome.

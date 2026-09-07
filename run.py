@@ -59,6 +59,12 @@ accelerator = get_accelerator()
 def print_end_message(jobs_completed, jobs_failed):
     if not accelerator.is_main_process:
         return
+    try:
+        from toolkit.xla_utils import is_master_ordinal
+        if not is_master_ordinal():
+            return
+    except Exception:
+        pass
     failure_string = f"{jobs_failed} failure{'' if jobs_failed == 1 else 's'}" if jobs_failed > 0 else ""
     completed_string = f"{jobs_completed} completed job{'' if jobs_completed == 1 else 's'}"
 
@@ -72,44 +78,91 @@ def print_end_message(jobs_completed, jobs_failed):
     print_acc("========================================")
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def _find_config_path(config_file):
+    # Mirror toolkit/config.py resolution without importing the job stack.
+    try:
+        from toolkit.paths import TOOLKIT_ROOT
+    except Exception:
+        TOOLKIT_ROOT = os.getcwd()
+    candidate = os.path.join(TOOLKIT_ROOT, 'config', config_file)
+    if os.path.exists(candidate):
+        return candidate
+    for ext in ('.json', '.jsonc', '.yaml', '.yml'):
+        if os.path.exists(candidate + ext):
+            return candidate + ext
+    if os.path.exists(config_file):
+        return config_file
+    abs_path = os.path.join(os.getcwd(), config_file)
+    if os.path.exists(abs_path):
+        return abs_path
+    return None
 
-    # require at lease one config file
-    parser.add_argument(
-        'config_file_list',
-        nargs='+',
-        type=str,
-        help='Name of config file (eg: person_v1 for config/person_v1.json/yaml), or full path if it is not in config folder, you can pass multiple config files and run them all sequentially'
-    )
 
-    # flag to continue if failed job
-    parser.add_argument(
-        '-r', '--recover',
-        action='store_true',
-        help='Continue running additional jobs even if a job fails'
-    )
+def _resolve_tpu_cores(config_file_list, cli_cores=None):
+    """How many TPU cores to spawn. Priority: --tpu_cores > AITK_TPU_CORES
+    env > max(train.tpu_num_cores) over the config files. Always >= 1."""
+    if cli_cores is not None:
+        try:
+            if int(cli_cores) >= 1:
+                return int(cli_cores)
+        except Exception:
+            pass
+    env_cores = os.environ.get('AITK_TPU_CORES', None)
+    if env_cores is not None:
+        try:
+            if int(env_cores) >= 1:
+                return int(env_cores)
+        except Exception:
+            pass
+    cores = 1
+    for config_file in config_file_list:
+        try:
+            path = _find_config_path(config_file)
+            if path is None:
+                continue
+            with open(path, 'r', encoding='utf-8') as f:
+                if path.endswith('.json') or path.endswith('.jsonc'):
+                    import json
+                    data = json.load(f)
+                else:
+                    import yaml
+                    data = yaml.safe_load(f)
+            processes = ((data or {}).get('config') or {}).get('process') or []
+            for proc in processes:
+                try:
+                    v = ((proc or {}).get('train') or {}).get('tpu_num_cores', 1)
+                    cores = max(cores, int(v or 1))
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return max(1, cores)
 
-    # flag to continue if failed job
-    parser.add_argument(
-        '-n', '--name',
-        type=str,
-        default=None,
-        help='Name to replace [name] tag in config file, useful for shared config file'
-    )
-    
-    parser.add_argument(
-        '-l', '--log',
-        type=str,
-        default=None,
-        help='Log file to write output to'
-    )
-    args = parser.parse_args()
-    
+
+def _tpu_worker(index, config_file_list, args):
+    """xmp.spawn target: one process per TPU core.
+
+    The module-level ``accelerator`` below was created at import time, before
+    the spawn machinery assigned this process its core. Drop it so every
+    downstream ``get_accelerator()`` binds this worker's own XLA device.
+    """
+    try:
+        import toolkit.accelerator as _acc_mod
+        _acc_mod.global_accelerator = None
+    except Exception:
+        pass
+    global accelerator
+    try:
+        accelerator = get_accelerator()
+    except Exception:
+        pass
+    _run_configs(config_file_list, args)
+
+
+def _run_configs(config_file_list, args):
     if args.log is not None:
         setup_log_to_file(args.log)
 
-    config_file_list = args.config_file_list
     if len(config_file_list) == 0:
         raise Exception("You must provide at least one config file")
 
@@ -146,6 +199,72 @@ def main():
                 print_acc("Job stopped")
                 print_acc("========================================")
                 sys.exit(0)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    # require at lease one config file
+    parser.add_argument(
+        'config_file_list',
+        nargs='+',
+        type=str,
+        help='Name of config file (eg: person_v1 for config/person_v1.json/yaml), or full path if it is not in config folder, you can pass multiple config files and run them all sequentially'
+    )
+
+    # flag to continue if failed job
+    parser.add_argument(
+        '-r', '--recover',
+        action='store_true',
+        help='Continue running additional jobs even if a job fails'
+    )
+
+    # flag to continue if failed job
+    parser.add_argument(
+        '-n', '--name',
+        type=str,
+        default=None,
+        help='Name to replace [name] tag in config file, useful for shared config file'
+    )
+
+    parser.add_argument(
+        '-l', '--log',
+        type=str,
+        default=None,
+        help='Log file to write output to'
+    )
+
+    parser.add_argument(
+        '--tpu_cores',
+        type=int,
+        default=None,
+        help='TPU cores for multi-core data-parallel training (overrides train.tpu_num_cores and AITK_TPU_CORES). Ignored off-TPU.'
+    )
+    args = parser.parse_args()
+
+    config_file_list = args.config_file_list
+
+    # Multi-core TPU: spawn one process per core before touching any job.
+    # Single-core / CUDA / CPU path below is untouched.
+    tpu_cores = _resolve_tpu_cores(config_file_list, args.tpu_cores)
+    if tpu_cores > 1:
+        try:
+            from toolkit.xla_utils import is_xla_available, has_tpu
+            tpu_visible = is_xla_available() and has_tpu()
+        except Exception:
+            tpu_visible = False
+        if tpu_visible:
+            print_acc(f"Spawning {tpu_cores} TPU worker processes")
+            import torch_xla.distributed.xla_multiprocessing as xmp
+            xmp.spawn(_tpu_worker, args=(config_file_list, args), nprocs=tpu_cores, start_method='spawn')
+            return
+        else:
+            print_acc(
+                f"tpu_num_cores={tpu_cores} requested but no TPU is visible; "
+                f"running single-process."
+            )
+
+    _run_configs(config_file_list, args)
 
 
 if __name__ == '__main__':
