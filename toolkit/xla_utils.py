@@ -266,6 +266,25 @@ def patch_checkpoint_for_xla() -> bool:
                 "(torch_xla rejects it); using XLA reentrant checkpoint."
             )
         kwargs.pop("use_reentrant", None)
+        # Reentrant checkpoint runs the block under no_grad, so its output
+        # only requires grad if at least one input does. With a frozen
+        # backbone (LoRA/LoKr: only adapters require grad, and they live
+        # *inside* the block) the inputs often carry no grad_fn, which ends
+        # in "element 0 of tensors does not require grad" at backward().
+        # Tag float inputs grad-requiring (no-op when already so, skipped
+        # for ids/masks): recompute still routes grads to the adapters, and
+        # the stray input .grad dies with the batch.
+        try:
+            args = tuple(
+                a.detach().requires_grad_(True)
+                if torch.is_tensor(a)
+                and a.is_floating_point()
+                and not a.requires_grad
+                else a
+                for a in args
+            )
+        except Exception:
+            pass
         if _have_xla_impl:
             try:
                 return _xla_checkpoint(function, *args, **kwargs)
