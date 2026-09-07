@@ -152,7 +152,6 @@ def _resolve_tpu_cores(config_file_list, cli_cores=None):
             detected = max(1, int(detect_tpu_cores()))
         except Exception:
             detected = 1
-        print_acc(f"Auto-detected {detected} TPU core{'s' if detected != 1 else ''}")
         return detected
     return max(1, resolved)
 
@@ -265,6 +264,16 @@ def main():
     # Multi-core TPU: spawn one process per core before touching any job.
     # Single-core / CUDA / CPU path below is untouched.
     tpu_cores = _resolve_tpu_cores(config_file_list, args.tpu_cores)
+    try:
+        from toolkit.xla_utils import detect_tpu_cores, is_xla_available, has_tpu
+        if is_xla_available() and has_tpu():
+            _detected = max(1, int(detect_tpu_cores()))
+            print_acc(
+                f"TPU detected: {_detected} core{'s' if _detected != 1 else ''} visible | "
+                f"training on {tpu_cores} core{'s' if tpu_cores != 1 else ''}"
+            )
+    except Exception:
+        pass
     if tpu_cores > 1:
         try:
             from toolkit.xla_utils import is_xla_available, has_tpu
