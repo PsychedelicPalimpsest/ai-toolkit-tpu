@@ -120,7 +120,9 @@ FLUX.2-klein full-finetune request):
 * `cache_latents_to_disk: true` + `cache_text_embeddings: true` + 
   `unload_text_encoder: true` all work on TPU and save HBM.
 * Multi-core data-parallel is supported: set `train.tpu_num_cores: 8`
-  (or pass `--tpu_cores 8` / `AITK_TPU_CORES=8`). `run.py` spawns one process
+  — or `tpu_num_cores: auto` to use every visible TPU core (1 off-TPU).
+  CLI `--tpu_cores` / env `AITK_TPU_CORES` accept an int or `auto` and win
+  over the config. `run.py` spawns one process
   per core via `torch_xla.distributed.xla_multiprocessing.spawn`; each core
   trains on a disjoint `file_list[ordinal::world_size]` dataset shard and
   gradients are averaged with `xm.optimizer_step`. Effective batch size is

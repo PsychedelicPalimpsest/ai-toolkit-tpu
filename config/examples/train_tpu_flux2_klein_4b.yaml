@@ -46,9 +46,10 @@ config:
         steps: 8000
         gradient_accumulation: 1
         # multi-core TPU data-parallel: 8 on a TPUv3-8 / v2-8 (one process per
-        # core, disjoint dataset shards, averaged grads). Effective batch =
+        # core, disjoint dataset shards, averaged grads), or "auto" to use
+        # every visible core. Effective batch =
         # batch_size x gradient_accumulation x tpu_num_cores. 1 = single-core.
-        # Overridable with --tpu_cores N or AITK_TPU_CORES=N. See docs/TPU.md.
+        # Overridable with --tpu_cores N|auto or AITK_TPU_CORES=N|auto. See docs/TPU.md.
         tpu_num_cores: 1
         train_unet: true
         train_text_encoder: false

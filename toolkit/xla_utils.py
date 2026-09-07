@@ -254,6 +254,29 @@ def is_xla_multiprocess() -> bool:
     return is_xla_available() and get_world_size() > 1
 
 
+def detect_tpu_cores() -> int:
+    """Number of visible TPU cores (length of the TPU device list).
+
+    Used to resolve ``tpu_num_cores: auto``. Returns 1 when torch_xla is
+    missing, no TPU is visible, or anything goes wrong — so ``auto`` safely
+    degrades to the old single-core behaviour off-TPU.
+    """
+    if not is_xla_available():
+        return 1
+    try:
+        import torch_xla.core.xla_model as xm
+        devices = [str(d) for d in xm.get_xla_supported_devices()]
+        tpu_devices = [d for d in devices if "TPU" in d.upper()]
+        if tpu_devices:
+            return max(1, len(tpu_devices))
+        # Unexpected device strings but a TPU is reachable: trust the hw check.
+        if has_tpu():
+            return max(1, len(devices))
+        return 1
+    except Exception:
+        return 1
+
+
 def is_global_main_process(accelerator=None) -> bool:
     """Rank-0 check that stays correct under TPU multi-core spawn.
 

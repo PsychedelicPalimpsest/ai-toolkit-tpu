@@ -488,12 +488,20 @@ class TrainConfig:
         # TPU multi-core data-parallel: number of TPU cores to train on
         # (xmp.spawn, one process per core, gradients averaged with
         # xm.optimizer_step). 1 = current single-core behaviour on every
-        # backend. Effective batch size scales with this value. See docs/TPU.md.
-        self.tpu_num_cores: int = kwargs.get('tpu_num_cores', 1) or 1
-        try:
-            self.tpu_num_cores = max(1, int(self.tpu_num_cores))
-        except Exception:
-            self.tpu_num_cores = 1
+        # backend. "auto" = use every visible TPU core (1 off-TPU).
+        # Effective batch size scales with this value. See docs/TPU.md.
+        _tpu_raw = kwargs.get('tpu_num_cores', 1)
+        if isinstance(_tpu_raw, str) and _tpu_raw.strip().lower() == 'auto':
+            try:
+                from toolkit.xla_utils import detect_tpu_cores
+                self.tpu_num_cores: int = max(1, int(detect_tpu_cores()))
+            except Exception:
+                self.tpu_num_cores = 1
+        else:
+            try:
+                self.tpu_num_cores: int = max(1, int(_tpu_raw or 1))
+            except Exception:
+                self.tpu_num_cores = 1
         if self.tpu_num_cores > 1:
             try:
                 from toolkit.xla_utils import is_xla_available, has_tpu, warn_once

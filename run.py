@@ -98,45 +98,63 @@ def _find_config_path(config_file):
     return None
 
 
+def _normalize_cores(value):
+    """int >= 1, the string 'auto', or None (unset/unparseable)."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() == 'auto':
+        return 'auto'
+    try:
+        v = int(value)
+        return v if v >= 1 else None
+    except Exception:
+        return None
+
+
 def _resolve_tpu_cores(config_file_list, cli_cores=None):
     """How many TPU cores to spawn. Priority: --tpu_cores > AITK_TPU_CORES
-    env > max(train.tpu_num_cores) over the config files. Always >= 1."""
-    if cli_cores is not None:
-        try:
-            if int(cli_cores) >= 1:
-                return int(cli_cores)
-        except Exception:
-            pass
-    env_cores = os.environ.get('AITK_TPU_CORES', None)
-    if env_cores is not None:
-        try:
-            if int(env_cores) >= 1:
-                return int(env_cores)
-        except Exception:
-            pass
-    cores = 1
-    for config_file in config_file_list:
-        try:
-            path = _find_config_path(config_file)
-            if path is None:
-                continue
-            with open(path, 'r', encoding='utf-8') as f:
-                if path.endswith('.json') or path.endswith('.jsonc'):
-                    import json
-                    data = json.load(f)
-                else:
-                    import yaml
-                    data = yaml.safe_load(f)
-            processes = ((data or {}).get('config') or {}).get('process') or []
-            for proc in processes:
-                try:
-                    v = ((proc or {}).get('train') or {}).get('tpu_num_cores', 1)
-                    cores = max(cores, int(v or 1))
-                except Exception:
+    env > max(train.tpu_num_cores) over the config files. Each level accepts
+    an int or 'auto' (use every visible TPU core, 1 off-TPU). Always >= 1."""
+    resolved = _normalize_cores(cli_cores)
+    if resolved is None:
+        resolved = _normalize_cores(os.environ.get('AITK_TPU_CORES', None))
+    if resolved is None:
+        cores = 1
+        for config_file in config_file_list:
+            try:
+                path = _find_config_path(config_file)
+                if path is None:
                     continue
+                with open(path, 'r', encoding='utf-8') as f:
+                    if path.endswith('.json') or path.endswith('.jsonc'):
+                        import json
+                        data = json.load(f)
+                    else:
+                        import yaml
+                        data = yaml.safe_load(f)
+                processes = ((data or {}).get('config') or {}).get('process') or []
+                for proc in processes:
+                    try:
+                        v = ((proc or {}).get('train') or {}).get('tpu_num_cores', 1)
+                        norm = _normalize_cores(v)
+                        if norm == 'auto':
+                            cores = 'auto'
+                        elif norm is not None:
+                            cores = max(cores if isinstance(cores, int) else 1, norm)
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        resolved = cores
+    if resolved == 'auto':
+        try:
+            from toolkit.xla_utils import detect_tpu_cores
+            detected = max(1, int(detect_tpu_cores()))
         except Exception:
-            continue
-    return max(1, cores)
+            detected = 1
+        print_acc(f"Auto-detected {detected} TPU core{'s' if detected != 1 else ''}")
+        return detected
+    return max(1, resolved)
 
 
 def _tpu_worker(index, config_file_list, args):
@@ -236,9 +254,9 @@ def main():
 
     parser.add_argument(
         '--tpu_cores',
-        type=int,
+        type=str,
         default=None,
-        help='TPU cores for multi-core data-parallel training (overrides train.tpu_num_cores and AITK_TPU_CORES). Ignored off-TPU.'
+        help='TPU cores for multi-core data-parallel training: int or "auto" (overrides train.tpu_num_cores and AITK_TPU_CORES). Ignored off-TPU.'
     )
     args = parser.parse_args()
 
