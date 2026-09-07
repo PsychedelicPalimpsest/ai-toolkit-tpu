@@ -209,6 +209,114 @@ def warn_once(message: str):
     warnings.warn(f"[ai-toolkit][TPU-compat] {message}", stacklevel=3)
 
 
+_checkpoint_patched_for_xla = False
+
+
+def patch_checkpoint_for_xla() -> bool:
+    """Make torch gradient checkpointing work on TPU hosts.
+
+    Stock ``torch.utils.checkpoint`` (non-reentrant path, the default since
+    torch 2.4) saves/restores RNG state via ``getattr(torch, device_type)``,
+    and ``torch.xla`` does not exist -> ``AttributeError`` on every
+    ``use_reentrant=False`` call. Upstream XLA explicitly does not support
+    ``use_reentrant=False`` (``torch_xla.utils.checkpoint`` raises for it).
+
+    Two complementary redirections (both verified against the torch_xla
+    2.9 source; XLA RNG states are ints via ``xm.get/set_rng_state``):
+
+    1. ``torch.utils.checkpoint.checkpoint`` -> wrapper forcing torch_xla's
+       own reentrant checkpoint (correct ``xm.fork_rng`` handling and
+       optimization barriers). Covers every module imported after the patch
+       lands, in both ``import ... as ckpt`` and ``from ... import`` styles.
+    2. ``torch.utils.checkpoint._get_device_module`` returns a tiny XLA shim
+       (``device()`` context + ``get/set_rng_state`` delegated to ``xm``,
+       ``_initialized = True``) for ``device_type == "xla"``. This keeps the
+       non-reentrant path working for callers that bound the original
+       ``checkpoint`` before the patch (e.g. HF libraries imported early).
+
+    Must run before model modules bind ``checkpoint``; safe to call
+    repeatedly; no-op when no TPU is visible. Returns True when active.
+    """
+    global _checkpoint_patched_for_xla
+    if _checkpoint_patched_for_xla:
+        return True
+    if not (is_xla_available() and has_tpu()):
+        return False
+    try:
+        import contextlib
+        import torch.utils.checkpoint as _tckpt
+        if getattr(_tckpt.checkpoint, "_aitk_xla_safe", False):
+            _checkpoint_patched_for_xla = True
+            return True
+        _orig_checkpoint = _tckpt.checkpoint
+        _orig_get_device_module = _tckpt._get_device_module
+    except Exception:
+        return False
+    try:
+        from torch_xla.utils.checkpoint import checkpoint as _xla_checkpoint
+        _have_xla_impl = True
+    except Exception:
+        _have_xla_impl = False
+
+    def _xla_safe_checkpoint(function, *args, **kwargs):
+        # torch_xla's implementation only supports reentrant mode.
+        if kwargs.get("use_reentrant", True) is False:
+            warn_once(
+                "use_reentrant=False is not supported on TPU/XLA "
+                "(torch_xla rejects it); using XLA reentrant checkpoint."
+            )
+        kwargs.pop("use_reentrant", None)
+        if _have_xla_impl:
+            try:
+                return _xla_checkpoint(function, *args, **kwargs)
+            except TypeError:
+                # Unknown kwarg for the XLA impl (e.g. newer torch-only
+                # flags like context_fn/debug): fall through to reentrant.
+                pass
+        kwargs["use_reentrant"] = True
+        return _orig_checkpoint(function, *args, **kwargs)
+
+    class _XlaDeviceModule:
+        """Minimal ``torch.cuda``-shaped facade over torch_xla RNG state.
+
+        Only what ``torch.utils.checkpoint`` needs: ``device()`` scoping
+        (per-process ordinal on XLA, so a no-op), int RNG states, and an
+        ``_initialized`` flag so the RNG save/restore path is taken.
+        """
+        _initialized = True
+
+        @staticmethod
+        @contextlib.contextmanager
+        def device(_index=None):
+            yield
+
+        @staticmethod
+        def get_rng_state(device=None):
+            import torch_xla.core.xla_model as xm
+            return xm.get_rng_state(device) if device is not None else xm.get_rng_state()
+
+        @staticmethod
+        def set_rng_state(state, device=None):
+            import torch_xla.core.xla_model as xm
+            if device is not None:
+                return xm.set_rng_state(state, device)
+            return xm.set_rng_state(state)
+
+    def _patched_get_device_module(device="cuda"):
+        if isinstance(device, str) and device.lower() == "xla":
+            return _XlaDeviceModule
+        return _orig_get_device_module(device)
+
+    try:
+        _xla_safe_checkpoint._aitk_xla_safe = True
+        _tckpt.checkpoint = _xla_safe_checkpoint
+        _tckpt._get_device_module = _patched_get_device_module
+    except Exception:
+        return False
+    _checkpoint_patched_for_xla = True
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Multi-core TPU (data-parallel across TPU cores via xmp.spawn).
 #

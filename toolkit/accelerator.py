@@ -22,6 +22,14 @@ def get_accelerator() -> Accelerator:
                 )
             elif str(global_accelerator.device).split(":")[0] == "xla":
                 print(f"[ai-toolkit][TPU-compat] Using XLA device {global_accelerator.device}")
+                # torch's non-reentrant gradient checkpointing looks up
+                # getattr(torch, 'xla') and crashes; route checkpointing
+                # through torch_xla before model code binds it.
+                try:
+                    from toolkit.xla_utils import patch_checkpoint_for_xla
+                    patch_checkpoint_for_xla()
+                except Exception:
+                    pass
         except Exception:
             pass
     return global_accelerator

@@ -58,6 +58,7 @@ Behavioural fallbacks (all warn once, never silent):
 | `model.low_vram / layer_offloading` | `torch.cuda.Stream/Event` offload | disabled, model stays on `xla` (`config_modules.py`, `memory_management/`) |
 | `train.xformers / sdp / attention_backend: flash` | CUDA kernels | forced off / `native` (`config_modules.py`) |
 | `train.dtype: bf16` | autocast bf16 | bf16 (correct TPU dtype; fp16 warns) |
+| gradient checkpointing (`use_reentrant=False`) | torch non-reentrant | rerouted to `torch_xla.utils.checkpoint` (reentrant) + XLA RNG shim — upstream XLA rejects `use_reentrant=False` outright |
 | `torch.cuda.*` RNG / cache / sync | as before | `seed_all` / no-op cache / `xm.wait_device_ops` |
 | `add_model_gpu_splitter_to_flux` | splits over `cuda:N` | no-op (avoids `total/0` crash) |
 
